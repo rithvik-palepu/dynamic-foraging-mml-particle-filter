@@ -1,86 +1,183 @@
 import numpy as np
+import pandas as pd
+import matplotlib
 import matplotlib.pyplot as plt
+from scipy.optimize import differential_evolution
+import psytrack
 
-def generate_drifting_agent_data(num_trials=500, seed=42):
+# Force headless plotting for HPC
+matplotlib.use('Agg')
+
+# Import your native MMLPF architecture
+from empirical_drifting_agent_mml_pf import calculate_nll_fast
+
+# ==========================================
+# 1. Synthetic Data Generator
+# ==========================================
+def generate_drifting_agent_data(env_type='volatile', num_sessions=25, trials_per_session=500, seed=42):
     """
-    Simulates a 2-armed bandit task where the agent's learning rate (alpha) 
-    and inverse temperature (beta) undergo a Gaussian random walk.
+    Simulates a 2-armed bandit task where learning rate and temp undergo a Gaussian random walk.
+    env_type: 'smooth' (continuous reward drift) or 'volatile' (sudden block switches).
     """
     np.random.seed(seed)
     
-    # Meta-parameters governing the random walk (Volatility)
     sigma_alpha = 0.05
     sigma_beta = 0.5
     
-    # Initialize latent states
     alpha = 0.5
     beta = 5.0
     Q = np.array([0.5, 0.5])
     
-    # Environment: Reward probabilities switch every 100 trials
     reward_probs = np.array([0.8, 0.2])
     
-    # Tracking arrays
-    choices, rewards = [], []
-    true_alpha, true_beta, true_Q = [], [], []
+    all_sessions_data = []
     
-    for t in range(num_trials):
-        # Trigger block switch
-        if t > 0 and t % 100 == 0:
-            reward_probs = reward_probs[::-1]
+    for session_id in range(num_sessions):
+        choices, rewards = [], []
+        
+        for t in range(trials_per_session):
+            # --- Environmental Dynamics ---
+            if env_type == 'volatile':
+                # Trigger sudden block switch
+                if t > 0 and t % 100 == 0:
+                    reward_probs = reward_probs[::-1]
+            elif env_type == 'smooth':
+                # Continuous, slow random walk of reward probabilities
+                reward_probs[0] = np.clip(reward_probs[0] + np.random.normal(0, 0.03), 0.1, 0.9)
+                reward_probs[1] = 1.0 - reward_probs[0]
+                
+            # --- Latent Cognitive Drift ---
+            alpha = np.clip(alpha + np.random.normal(0, sigma_alpha), 0.01, 0.99)
+            beta = np.clip(beta + np.random.normal(0, sigma_beta), 0.1, 20.0)
             
-        # 1. Random walk for latents (with biological bounds applied)
-        alpha = np.clip(alpha + np.random.normal(0, sigma_alpha), 0.01, 0.99)
-        beta = np.clip(beta + np.random.normal(0, sigma_beta), 0.1, 20.0)
+            # --- Agent Decision ---
+            exp_Q = np.exp(beta * (Q - np.max(Q)))
+            probs = exp_Q / np.sum(exp_Q)
+            choice = np.random.choice([0, 1], p=probs)
+            
+            # --- Environment Response & Memory Update ---
+            reward = np.random.binomial(1, reward_probs[choice])
+            Q[choice] += alpha * (reward - Q[choice])
+            
+            choices.append(choice)
+            rewards.append(reward)
+            
+        # Store session data
+        df = pd.DataFrame({'session_id': session_id + 1, 'choice': choices, 'reward': rewards})
+        all_sessions_data.append(df)
         
-        true_alpha.append(alpha)
-        true_beta.append(beta)
-        true_Q.append(Q.copy())
-        
-        # 2. Agent makes a decision
-        exp_Q = np.exp(beta * (Q - np.max(Q)))
-        probs = exp_Q / np.sum(exp_Q)
-        choice = np.random.choice([0, 1], p=probs)
-        
-        # 3. Environment delivers reward
-        reward = np.random.binomial(1, reward_probs[choice])
-        
-        # 4. Agent updates internal model (Q-learning)
-        Q[choice] += alpha * (reward - Q[choice])
-        
-        choices.append(choice)
-        rewards.append(reward)
-        
-    return {
-        'choices': np.array(choices),
-        'rewards': np.array(rewards),
-        'true_alpha': np.array(true_alpha),
-        'true_beta': np.array(true_beta),
-        'true_Q': np.array(true_Q)
-    }
+    return pd.concat(all_sessions_data, ignore_index=True)
 
-if __name__ == "__main__":
-    # Quick visual verification of the synthetic biology
-    data = generate_drifting_agent_data(num_trials=500, seed=10)
+# ==========================================
+# 2. Walk-Forward Cross-Validation Pipeline
+# ==========================================
+def run_walk_forward_cv(data_df):
+    num_sessions = data_df['session_id'].max()
+    mmlpf_nll_history = []
+    psytrack_nll_history = []
+    session_timeline = []
     
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-    
-    axes[0].plot(data['true_Q'][:, 0], color='blue', label='Q Left')
-    axes[0].plot(data['true_Q'][:, 1], color='red', label='Q Right')
-    axes[0].set_ylabel("True Q-Values")
-    axes[0].legend(loc='upper right')
-    axes[0].set_title("Synthetic Ground Truth: Drifting Latent States")
-    
-    axes[1].plot(data['true_beta'], color='black')
-    axes[1].set_ylabel(r"True Inverse Temp ($\beta$)")
-    
-    axes[2].plot(data['true_alpha'], color='black')
-    axes[2].set_ylabel(r"True Learning Rate ($\alpha$)")
-    axes[2].set_xlabel("Trials")
-    
-    for ax in axes:
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
+    # Start CV at session 3 to ensure enough history for initial training
+    for target_session in range(3, num_sessions + 1):
+        print(f"  -> Walk-Forward: Training on 1 to {target_session-1}, Testing on {target_session}")
         
+        # Split Data
+        train_data = data_df[data_df['session_id'] < target_session]
+        test_data = data_df[data_df['session_id'] == target_session]
+        
+        train_choices = train_data['choice'].values
+        train_rewards = train_data['reward'].values
+        test_choices = test_data['choice'].values
+        test_rewards = test_data['reward'].values
+        
+        # ------------------------------------------------
+        # Model 1: MMLPF Architecture
+        # ------------------------------------------------
+        # Optimize volatilities on historical data
+        mml_opt = differential_evolution(
+            func=calculate_nll_fast, 
+            bounds=[(0.001, 0.2), (0.001, 0.2)], 
+            args=(train_choices, train_rewards),
+            maxiter=20, popsize=10, tol=0.05, workers=-1, disp=False
+        )
+        opt_sigma_alpha, opt_sigma_beta = mml_opt.x
+        
+        # Test on unseen future session
+        out_of_sample_mml_nll = calculate_nll_fast(
+            (opt_sigma_alpha, opt_sigma_beta), test_choices, test_rewards, num_particles=1000
+        )
+        # Normalize to average NLL per trial for fair comparison
+        mmlpf_nll_history.append(out_of_sample_mml_nll / len(test_choices))
+        
+        # ------------------------------------------------
+        # Model 2: PsyTrack Baseline
+        # ------------------------------------------------
+        # Format for PsyTrack dictionary requirements
+        train_dict = {
+            'y': train_choices + 1, # PsyTrack expects 1 and 2
+            'inputs': {'reward_history': np.expand_dims(train_rewards, axis=1)}
+        }
+        weights = {'bias': 1, 'reward_history': 1}
+        K = np.sum([weights[k] for k in weights.keys()])
+        hyper_guess = {'sigma': [2**-5]*K, 'sigInit': 2**5, 'sigDay': 2**-5}
+        
+        # Optimize MAP on historical data
+        try:
+            hyp, _, _, _ = psytrack.hyperOpt(train_dict, hyper_guess, weights, ['sigma', 'sigDay'], showOpt=0)
+            
+            # Extract out-of-sample NLL for PsyTrack (simplified evaluation for native CV)
+            # A full implementation would project the weights forward; here we approximate out-of-sample 
+            # by evaluating the test dict using the optimized hyperparameters.
+            test_dict = {
+                'y': test_choices + 1,
+                'inputs': {'reward_history': np.expand_dims(test_rewards, axis=1)}
+            }
+            out_of_sample_psy_nll = psytrack.get_nll(test_dict, hyp, weights)
+            psytrack_nll_history.append(out_of_sample_psy_nll / len(test_choices))
+            
+        except Exception as e:
+            print(f"     PsyTrack fit failed: {e}")
+            psytrack_nll_history.append(np.nan)
+            
+        session_timeline.append(target_session)
+        
+    return session_timeline, mmlpf_nll_history, psytrack_nll_history
+
+# ==========================================
+# 3. Execution & Presentation Plotting
+# ==========================================
+if __name__ == "__main__":
+    print("Generating Volatile Environment (MMLPF Favored)...")
+    volatile_data = generate_drifting_agent_data(env_type='volatile')
+    print("Running Walk-Forward CV on Volatile Data...")
+    vol_sessions, vol_mml_nll, vol_psy_nll = run_walk_forward_cv(volatile_data)
+    
+    print("\nGenerating Smooth Environment (PsyTrack Favored)...")
+    smooth_data = generate_drifting_agent_data(env_type='smooth')
+    print("Running Walk-Forward CV on Smooth Data...")
+    smooth_sessions, smooth_mml_nll, smooth_psy_nll = run_walk_forward_cv(smooth_data)
+    
+    print("\nGenerating Presentation Graphic...")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6), sharey=True)
+    
+    # Plot 1: Volatile Environment
+    ax1.plot(vol_sessions, vol_mml_nll, color='#5b5cf0', linewidth=3, marker='o', label='MMLPF Architecture')
+    ax1.plot(vol_sessions, vol_psy_nll, color='gray', linewidth=3, marker='s', linestyle='--', label='PsyTrack Baseline')
+    ax1.set_title('Volatile Environment\n(Sudden Reward Reversals)', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('Test Session Number', fontsize=12)
+    ax1.set_ylabel('Out-of-Sample NLL per Trial\n(Lower is Better)', fontsize=12)
+    ax1.grid(True, linestyle='--', alpha=0.5)
+    ax1.legend()
+
+    # Plot 2: Smooth Environment
+    ax2.plot(smooth_sessions, smooth_mml_nll, color='#5b5cf0', linewidth=3, marker='o', label='MMLPF Architecture')
+    ax2.plot(smooth_sessions, smooth_psy_nll, color='gray', linewidth=3, marker='s', linestyle='--', label='PsyTrack Baseline')
+    ax2.set_title('Smooth Environment\n(Continuous Gaussian Drift)', fontsize=14, fontweight='bold')
+    ax2.set_xlabel('Test Session Number', fontsize=12)
+    ax2.grid(True, linestyle='--', alpha=0.5)
+    ax2.legend()
+    
     plt.tight_layout()
-    plt.show()
+    save_path = "synthetic_boundary_test.png"
+    plt.savefig(save_path, dpi=300)
+    print(f"Success! Boundary test saved to '{save_path}'")
