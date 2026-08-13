@@ -93,12 +93,12 @@ def run_walk_forward_cv(data_df):
         # ------------------------------------------------
         # Model 1: MMLPF Architecture
         # ------------------------------------------------
-        # Optimize volatilities on historical data
+        # Optimize volatilities on historical data (added updating='deferred' to silence warning)
         mml_opt = differential_evolution(
             func=calculate_nll_fast, 
             bounds=[(0.001, 0.2), (0.001, 0.2)], 
             args=(train_choices, train_rewards),
-            maxiter=20, popsize=10, tol=0.05, workers=-1, disp=False
+            maxiter=20, popsize=10, tol=0.05, workers=-1, updating='deferred', disp=False
         )
         opt_sigma_alpha, opt_sigma_beta = mml_opt.x
         
@@ -112,27 +112,35 @@ def run_walk_forward_cv(data_df):
         # ------------------------------------------------
         # Model 2: PsyTrack Baseline
         # ------------------------------------------------
-        # Format for PsyTrack dictionary requirements
+        # Added dayLength to dictionary to silence the sigDay warning
         train_dict = {
-            'y': train_choices + 1, # PsyTrack expects 1 and 2
-            'inputs': {'reward_history': np.expand_dims(train_rewards, axis=1)}
+            'y': train_choices + 1, 
+            'inputs': {'reward_history': np.expand_dims(train_rewards, axis=1)},
+            'dayLength': np.array([len(train_choices)]) 
         }
         weights = {'bias': 1, 'reward_history': 1}
         K = np.sum([weights[k] for k in weights.keys()])
         hyper_guess = {'sigma': [2**-5]*K, 'sigInit': 2**5, 'sigDay': 2**-5}
         
-        # Optimize MAP on historical data
         try:
-            hyp, _, _, _ = psytrack.hyperOpt(train_dict, hyper_guess, weights, ['sigma', 'sigDay'], showOpt=0)
+            # Capture wMode (the hidden weight states) from the optimization
+            hyp, evd, wMode, hess_info = psytrack.hyperOpt(train_dict, hyper_guess, weights, ['sigma', 'sigDay'], showOpt=0)
             
-            # Extract out-of-sample NLL for PsyTrack (simplified evaluation for native CV)
-            # A full implementation would project the weights forward; here we approximate out-of-sample 
-            # by evaluating the test dict using the optimized hyperparameters.
-            test_dict = {
-                'y': test_choices + 1,
-                'inputs': {'reward_history': np.expand_dims(test_rewards, axis=1)}
-            }
-            out_of_sample_psy_nll = psytrack.get_nll(test_dict, hyp, weights)
+            # Extract final weights from the very last trial of the training set
+            final_weights = wMode[:, -1]
+            
+            # Construct Test X Matrix: Row 0 is Bias (1s), Row 1 is Test Rewards
+            X_test = np.vstack([np.ones(len(test_choices)), test_rewards])
+            
+            # Calculate predicted probabilities for choice == 1 (Right)
+            log_odds = np.dot(final_weights, X_test)
+            p_right = 1.0 / (1.0 + np.exp(-log_odds))
+            
+            # Calculate NLL based on the actual choices made in the test set
+            p_chosen = np.where(test_choices == 1, p_right, 1.0 - p_right)
+            p_chosen = np.clip(p_chosen, 1e-16, 1.0 - 1e-16)
+            out_of_sample_psy_nll = -np.sum(np.log(p_chosen))
+            
             psytrack_nll_history.append(out_of_sample_psy_nll / len(test_choices))
             
         except Exception as e:
