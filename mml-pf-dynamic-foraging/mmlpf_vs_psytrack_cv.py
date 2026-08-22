@@ -63,7 +63,18 @@ import psytrack
 # ---------------------------------------------------------------------------
 # cohort definition
 # ---------------------------------------------------------------------------
-COHORT_QUERY = ("task LIKE '%Uncoupled%' AND foraging_eff > 0.8 "
+# NOTE: foraging_eff and finished_trials are per-SESSION columns, so this
+# selects sessions, not animals. A mouse enters the cohort when it has enough
+# qualifying sessions; its other sessions exist in the database and are simply
+# not used. Describe it that way in methods.
+#
+# Threshold history: this was 0.8 for the walk-forward run and the first
+# block-CV runs (713379 / 751766). Lowered to 0.65 to match
+# single_subject_comparison.py and to widen the cohort -- high-efficiency
+# sessions are where a value-learning model is most favoured, so restricting to
+# them biases the comparison toward the MMLPF. Results produced before this
+# change are NOT comparable to results produced after it.
+COHORT_QUERY = ("task LIKE '%Uncoupled%' AND foraging_eff > 0.65 "
                 "AND finished_trials > 300")
 N_SUBJECTS = 10
 N_SESSIONS = 10
