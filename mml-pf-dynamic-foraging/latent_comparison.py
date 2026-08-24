@@ -80,7 +80,12 @@ def load_session(subject_id, session_number=2):
         raise ValueError(
             f"subject {subject_id}: {len(sessions)} sessions pass "
             f"COHORT_QUERY, cannot reach session {session_number}")
-    picked = sessions.head(cv.N_SESSIONS)
+    # Fetch at least enough sessions to REACH the requested one. cv.N_SESSIONS
+    # is 10 (the walk-forward default) while the block-CV cohort used 20, so
+    # head(cv.N_SESSIONS) silently truncated and any request above 10 died with
+    # an opaque "list index out of range" from the groups[] lookup below.
+    n_fetch = max(cv.N_SESSIONS, session_number)
+    picked = sessions.head(n_fetch)
 
     cols = ["animal_response", "earned_reward",
             "reward_probabilityL", "reward_probabilityR"]
@@ -90,6 +95,13 @@ def load_session(subject_id, session_number=2):
         trials = db.fetch_trials(picked, columns=cols[:2])
 
     groups = list(trials.groupby(["session_date", "session_id"], sort=True))
+    if session_number > len(groups):
+        raise ValueError(
+            f"subject {subject_id}: asked for session {session_number} but only "
+            f"{len(groups)} sessions came back from fetch_trials (requested "
+            f"{n_fetch}). The session numbering must match "
+            f"hpc_block_cv.prepare's, which orders by session_date and takes "
+            f"the first {getattr(cv, 'N_SESSIONS', '?')}+ per subject.")
     raw = groups[session_number - 1][1].reset_index(drop=True)
     v = raw[raw["animal_response"] != 2]
     n_ign = int((raw["animal_response"] == 2).sum())
