@@ -1,0 +1,25 @@
+# Byte-compiled / editor cruft
+__pycache__/
+*.pyc
+.DS_Store
+
+# Cached per-subject trial arrays written by `hpc_block_cv.py prepare`, and
+# per-subject output directories written by the `task` stage. The cache is
+# ~25 KB per subject and rebuilds from the database in minutes, so there is no
+# reason to version it. Note it is also the one artefact in this project that
+# is NOT reproducible across time: running the identical COHORT_QUERY months
+# apart has returned a disjoint set of animals, because the upstream database
+# contents changed. Treat a cache as belonging to one analysis run.
+cache*/
+out*/
+
+# Written automatically by the resume guards, never by hand:
+#   *_old_*      a results CSV whose schema predates the current RESULT_COLUMNS
+#   *_partial_*  a subject that was scored only partially, moved aside because
+#                its shared volatility is the median over ALL its placements
+*_old_*.csv
+*_partial_*.csv
+
+# Scratch figures written to the working directory by the comparison scripts.
+# Only the repo root is matched, so curated figures under data/ stay tracked.
+/*.png

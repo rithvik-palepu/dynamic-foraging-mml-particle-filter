@@ -1,0 +1,130 @@
+Two-pass subject-level volatility, resampling fixes, repo hygiene
+
+Scoring
+-------
+block_cv.score_session gains `sigmas=` (use a given volatility instead of
+fitting one) and `fit_only=` (return the fitted volatility and skip the GLM
+and the scored pass). hpc_block_cv.run_task uses both to score in two passes:
+pass 1 fits a volatility per (session, placement), pass 2 takes the median
+across the subject's placements and re-scores everything at that shared value.
+
+The motivation is measured, not assumed. On sessions simulated with a TRUE
+volatility of exactly zero, the per-session estimate ranged over [0.001, 0.400]
+-- essentially the whole search interval -- with a median of 0.13. The
+likelihood surface in sigma is nearly flat and what the optimiser returns is
+dominated by session-level noise. Taking the median across a subject's sessions
+cuts the across-subject spread by roughly a factor of three (sd 0.019 vs 0.073
+within-subject for sigma_alpha).
+
+Pooling via a joint likelihood over sessions (block_cv.fit_pooled, included and
+documented) was also tried and is WORSE at matched compute: across-subject sd
+0.035 vs 0.019 for sigma_alpha, 0.049 vs 0.010 for sigma_beta. The median of
+per-session fits wins because it averages; a single differential-evolution run
+on a flat multimodal surface does not. fit_pooled is kept but is not the
+default.
+
+Results now record both volatilities: sigma_{alpha,beta,phi} is the shared
+value used for scoring, sigma_*_session is that placement's own fit, and
+n_sigma_fits is how many went into the median. The task stage prints the
+across-placement range, which is the quantity that should be reported -- a
+sigma whose range spans the search interval is unidentified, not estimated.
+
+Resampling
+----------
+mmlpf_masked gains `resample=` ("systematic" or "multinomial") and
+`resample_threshold=` (resample only when the effective sample size falls
+below threshold*N). Fitting and scoring now default to systematic with
+threshold 0.5; mmlpf_masked itself still defaults to multinomial-every-trial,
+so any direct caller reproduces exactly. Verified byte-identical at the old
+defaults: NLL agreeing to ten decimals and every collected array, including
+the particle histograms, unchanged.
+
+Systematic resampling halves the bias in the volatility estimate at every
+particle count tested (median sigma_alpha 0.150/0.130/0.130 -> 0.060/0.060/
+0.065 at N = 100/400/1600, against a truth of zero).
+
+Two earlier hypotheses were tested and REJECTED, and the code reflects that:
+sigma does not fall with particle count (flat from N=100 to N=1600 at six
+seeds), and selecting sigma by held-out rather than training likelihood picks
+the same value, so cross-validating the hyperparameter would change nothing.
+The practical cost of a mis-chosen volatility is small -- the held-out
+likelihood is nearly flat in sigma -- so this is an interpretability fix, not
+a predictive one.
+
+Resume semantics (BREAKING for existing per-subject CSVs)
+--------------------------------------------------------
+The resume unit is now the SUBJECT, not the placement. A complete CSV is
+skipped; a partial one is moved aside as *_partial_<timestamp>.csv and the
+subject is refit whole. Resuming placement-by-placement would leave some rows
+scored under one shared volatility and the rest under another -- two models
+silently mixed in one file, the same failure mode as the earlier schema drift.
+The four new columns also trip the existing schema guard, so pre-existing
+per-subject CSVs are renamed rather than appended to.
+
+Terminology
+-----------
+Renamed all 13 occurrences of "M-step" across seven files to "volatility fit".
+There is no E-step and no expected complete-data likelihood: this is a direct
+maximum marginal likelihood fit of the volatilities, with differential
+evolution outside and the particle filter supplying the likelihood estimate.
+The EM wording would not survive a methods section.
+
+Repo hygiene
+------------
+Added .gitignore (bytecode, caches, resume backups, scratch figures at the
+repo root -- data/ figures stay tracked), requirements.txt, and README.md.
+
+requirements.txt records a non-obvious constraint for the cluster container:
+compute nodes need psytrack and matplotlib even though no compute job calls
+them, because `import hpc_block_cv` reaches `mmlpf_vs_psytrack_cv`, which
+imports both at module level. Omitting either kills every array task at
+import.
+
+Removed (to Trash): __pycache__/ including stale .pyc files for modules that
+no longer exist, .DS_Store, and two regenerable test caches, cache_demo/
+(synthetic) and cache_lap/ (12 subjects). cache50/ is kept.
+
+Pruned 12 superseded scripts: check_progress, construct_validity,
+drift_dynamic_recovery, local_cohort_comparable_validation, matched_validation,
+merge_and_plot_cohort, pf_plots, plot_cross_validation_nll,
+plot_single_trajectory, session_model_comparison, solution_comparison,
+two_subject_comparison.
+
+matched_validation was load-bearing: block_cv, latent_comparison,
+engagement_comparison, bias_model_comparison and bias_showcase all imported it
+at module level, so deleting it outright would have broken every array task at
+import. Each of them used exactly one function and nothing else, so
+build_glm_regressors (25 lines) moved into block_cv.py beside the GLM it feeds,
+and those four callers now import it from there. No circular import is created
+-- all four already imported block_cv. Verified: all eight pipeline modules
+import with matched_validation absent, and build_glm_regressors returns the
+same shapes with the session-boundary zeroing intact.
+
+empirical_drifting_agent_mml_pf.py is deliberately NOT removed. Nothing
+imports it any more, but block_cv's particle dynamics, parameterisations and
+clip bounds were copied from it verbatim; it is the provenance for the whole
+comparison.
+
+Results consolidated into data/
+-------------------------------
+Every CSV at the repo root moved into data/ -- these are fitting results:
+small, slow to regenerate, and in two cases unreproducible.
+local_cohort_comparable_validation.csv in particular can no longer be
+regenerated at all, since its generating script is gone.
+
+Four figures kept and moved: showcase_{707254,707535,708299}_real.png and
+showcase_708299_v2_real.png. 707535 is the only real-data win, 707254 and
+708299 are the two documented losses that make it credible, and the
+708299 v1/v2 pair is the before/after evidence for the parameterisation fix --
+the v1 half cannot be regenerated now that block_cv is PARAM_VERSION 2.
+
+Ten figures removed: bias_comparison.png and bias_parameterization.png
+(regenerable with --summarize from the CSVs now in data/), the four
+bias_showcase_* figures (superseded by the named showcase_* runs), the three
+showcase_synth_* figures (synthetic, i.e. simulated from the model under test),
+and latent_comparison_648586_s2.png (regenerable with latent_comparison.py).
+
+Not comparable to earlier results
+---------------------------------
+Everything in data/ predates PARAM_VERSION 2 and the resampling change. Do not
+pool old and new cohort numbers.

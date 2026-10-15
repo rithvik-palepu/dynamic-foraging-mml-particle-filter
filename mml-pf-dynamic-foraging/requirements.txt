@@ -1,0 +1,40 @@
+# Dependencies for the MML-PF / PsyTrack block-CV pipeline.
+#
+# Determined from module-level imports (ast, not grep) across the active
+# pipeline: hpc_block_cv, block_cv, mmlpf_vs_psytrack_cv,
+# bias_model_comparison, engagement_comparison, bias_showcase,
+# bias_parameterization, latent_comparison.
+#
+# Pin these before building the cluster container. `pip freeze` on the
+# environment that produced your current results is the right source of truth;
+# unpinned installs will silently change numerical output between runs.
+
+numpy
+scipy
+pandas
+
+# Required on COMPUTE NODES too, even though no compute job calls them.
+# `import hpc_block_cv` -> `import mmlpf_vs_psytrack_cv`, which imports
+# psytrack and matplotlib at module level. Omit either from the container and
+# every array task dies at import with a ModuleNotFoundError. Moving those two
+# imports inside the functions that use them would let the compute image drop
+# both, and is worth doing if container size ever matters.
+psytrack
+matplotlib
+
+# ---------------------------------------------------------------------------
+# NOT needed on compute nodes -- `prepare` and the figure scripts only
+# ---------------------------------------------------------------------------
+# The three-stage design exists so that compute nodes never touch the
+# database: `prepare` caches every subject's trial arrays to .npz first, and
+# the array tasks read only those files. Install these wherever you run
+# `prepare` and the session figures, not in the job container.
+#
+# aind-dynamic-foraging-database          # prepare: session/trial queries
+# aind-dynamic-foraging-basic-analysis    # plot_foraging_session only
+# duckdb                                  # S3 parquet access for the above
+#
+# One further gap: engagement_comparison.plot_recovery imports `figure_style`
+# inside the function body. That module is not on PyPI and is not in this
+# repo, so that one plotting call fails anywhere it is not separately
+# available. It does not affect any fitting or scoring path.

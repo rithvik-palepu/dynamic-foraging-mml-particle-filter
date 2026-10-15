@@ -80,14 +80,96 @@ from scipy.special import expit
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import mmlpf_vs_psytrack_cv as cv
-from matched_validation import build_glm_regressors
 
 N_LAGS = cv.N_LAGS
 M_PARTICLES = 300           # particles during the hyperparameter search
 E_PARTICLES = 1500          # particles for the scored pass
 DE_MAXITER = 20
 DE_POPSIZE = 12
+# Parameterisation version. Bumped whenever a change alters what the states
+# MEAN, so that results fit under different versions cannot be silently pooled
+# or resumed into one another. v2: alpha moved from log to logit space and the
+# beta clip moved from the value to the state (see mmlpf_masked).
+PARAM_VERSION = 2
+
+# alpha lives in (0, 1) and is tracked in LOGIT space, so no clip is required:
+# expit maps the whole real line into the open interval. It was previously
+# tracked in log space and clipped at 0.99, which allowed a particle's state to
+# random-walk far above the clip while displaying as 0.99 -- an absorbing shelf
+# where many distinct states collapsed to one value. On data simulated with a
+# CONSTANT alpha of 0.35, that put 32% of particle mass above alpha = 0.95 at
+# sigma_alpha = 0.22 and 44% at 0.40. The apparent bimodality was the
+# parameterisation, not the animal.
+ALPHA_PRIOR_LOGIT = (-0.847, 0.65)   # logit(0.30); sd chosen to span ~0.14-0.53
+
+# beta is positive and unbounded above, so log space is the right choice for
+# it, but the same shelf existed: exp(P) was clipped while P itself kept
+# walking. The state is now clipped instead, which makes the boundary
+# one-step-reversible.
+LOG_BETA_LO, LOG_BETA_HI = np.log(0.01), np.log(100.0)
+
+def _resample_idx(weights, num, scheme):
+    """Indices of surviving particles.
+
+    "multinomial" draws num independent samples -- the highest-variance choice
+    available, and the original behaviour. "systematic" places num equally
+    spaced pointers after a single uniform jitter, which has strictly lower
+    resampling variance for the same particle count and is the standard
+    default in the particle-filter literature. Lower resampling variance means
+    a larger effective sample size for the same N, which is what the volatility
+    fit is short of.
+    """
+    if scheme == "systematic":
+        u = np.random.uniform(0.0, 1.0 / num)
+        pos = u + np.arange(num) / num
+        cum = np.cumsum(weights)
+        cum[-1] = 1.0
+        return np.searchsorted(cum, pos)
+    if scheme != "multinomial":
+        raise ValueError(f"resample must be 'systematic' or 'multinomial', "
+                         f"got {scheme!r}")
+    return np.random.choice(num, size=num, p=weights)
+
+
 DE_BOUNDS = [(0.001, 0.4)] * 3
+# Fourth entry is sigma_bias, and it is DELIBERATELY NARROWER than the others.
+#
+# With the wide (0.001, 0.4) range the volatility fit fits sigma_bias ~ 0.16 even when
+# the generative bias is exactly constant, and ~0.19-0.30 on real sessions --
+# an order of magnitude above the truth in the cases where truth is known. The
+# consequence is measured, not hypothetical: the wandering bias state absorbs
+# 30-45% of the perseveration weight (median phi 1.35 -> 0.76 on constant-bias
+# simulations) and costs ~0.02-0.04 bits/trial of held-out accuracy. A free
+# walk here does not let the data decide how much the bias drifts; binary
+# choices carry too little information per trial to pin it down, so the walk
+# wanders by default.
+#
+# 0.05 keeps a genuinely slow within-session drift reachable -- PsyTrack's own
+# bias weight moves by ~2 units across a real session, which a hard 0 could not
+# represent -- while making the runaway values unreachable. Lower bound is 0.0
+# so the volatility fit can choose a fully static bias.
+#
+# Results from before this change used (0.001, 0.4) and are NOT comparable;
+# any 6-state cohort numbers predating it need refitting.
+DE_BOUNDS_BIAS = [(0.001, 0.4)] * 3 + [(0.0, 0.05)]
+# Fifth entry is sigma_engage, and it is deliberately MUCH WIDER than the
+# others. That looks inconsistent with the tight sigma_bias bound; it is not,
+# and the reason matters.
+#
+# A bias state has no observation channel of its own -- it is inferred only from
+# how skewed the choices look -- so a wide walk there wanders and steals
+# variance from phi. Engagement does have its own channel: the no-response
+# trials are direct observations of theta, so the data pins it down and the
+# bound only has to be wide enough to let it move.
+#
+# And it must move fast. Observed ignore runs are 27-32 trials with abrupt
+# onsets, so theta has to travel several logits within ~10 trials. Measured on
+# simulated data with known ignore blocks, the separation between theta inside
+# and outside those blocks is +0.001 at sigma 0.05, +0.44 at 0.30 and +0.68 at
+# 1.5, with training NLL still improving to 1.5 and flat by 2.0. A 0.05 cap --
+# the value that is right for the bias -- leaves theta frozen at its prior and
+# the state does nothing.
+DE_BOUNDS_ENGAGE = [(0.001, 0.4)] * 3 + [(0.0, 0.05), (0.01, 2.0)]
 GLM_BOUNDS = [(1e-4, 1.0)]  # one shared sigma for the GLM random walk
 BURN_IN = 50                # leading trials always assigned to training
 
@@ -120,6 +202,35 @@ def make_block_mask(n_trials, block=20, test_frac=0.2, burn_in=BURN_IN, seed=0):
 # ---------------------------------------------------------------------------
 # PsyTrack model under a training mask
 # ---------------------------------------------------------------------------
+# Moved here from matched_validation.py, which was removed. Every caller in
+# the pipeline imported this one function and nothing else from that module,
+# and it belongs beside the GLM it feeds.
+def build_glm_regressors(choices, rewards, session_ids, n_lags=2):
+    """Rewarded- and unrewarded-choice history at lags 1..n_lags.
+
+    Returns (rew, unrew) each shape (N, n_lags), coded +1 for a right choice,
+    -1 for a left choice, 0 where the lag crosses a session boundary.
+    Session boundaries are respected: trial 0 of a session has no history.
+    """
+    choices = np.asarray(choices, int)
+    rewards = np.asarray(rewards, int)
+    session_ids = np.asarray(session_ids)
+    n = len(choices)
+
+    signed = np.where(choices == 1, 1.0, -1.0)
+    rew = np.zeros((n, n_lags))
+    unrew = np.zeros((n, n_lags))
+
+    for lag in range(1, n_lags + 1):
+        idx = np.arange(lag, n)
+        same_session = session_ids[idx] == session_ids[idx - lag]
+        prev_signed = signed[idx - lag]
+        prev_rewarded = rewards[idx - lag] == 1
+        rew[idx, lag - 1] = np.where(same_session & prev_rewarded, prev_signed, 0.0)
+        unrew[idx, lag - 1] = np.where(same_session & ~prev_rewarded, prev_signed, 0.0)
+    return rew, unrew
+
+
 def glm_masked(X, y, sigma, train_mask, w0=None, P0=0.25, smooth=False,
                return_weights=False):
     """Laplace filter that updates only on training trials.
@@ -201,74 +312,242 @@ def fit_glm_sigma(X, y, train_mask, maxiter=DE_MAXITER, popsize=DE_POPSIZE,
 # MMLPF + perseveration under a training mask
 # ---------------------------------------------------------------------------
 def mmlpf_masked(sigma_alpha, sigma_beta, sigma_phi, choices, rewards,
-                 train_mask, num_particles=M_PARTICLES, seed=42, collect=False):
+                 train_mask, num_particles=M_PARTICLES, seed=42, collect=False,
+                 sigma_bias=None, hist_bins=None, sigma_engage=None,
+                 ignored=None, resample="multinomial",
+                 resample_threshold=1.0):
     """The perseveration filter, reweighting only on training trials.
 
     Identical to calculate_nll_window_persev except for the mask. The Q update
     runs on every trial: the animal's choice and reward are observed on a
     held-out trial too, and withholding them would be withholding data rather
     than withholding a likelihood term.
+
+    OPTIONAL DRIFTING BIAS (sigma_bias)
+    -----------------------------------
+    sigma_bias=None (default) is the five-state filter:
+
+        z = beta_t * (Q_R - Q_L) + phi_t * c_{t-1}
+
+    Passing a float adds a SIXTH state b_t, the analogue of PsyTrack's bias
+    regressor:
+
+        z = beta_t * (Q_R - Q_L) + phi_t * c_{t-1} + b_t
+        b_t = b_{t-1} + N(0, sigma_bias)
+
+    b_t is a constant offset -- identical on every trial -- whereas
+    phi * c_{t-1} FLIPS SIGN with the animal's last choice. They are different
+    regressors and cannot substitute: phi can absorb at most (2p-1)^2 of a
+    constant bias, where p = P(preferred side), so 36% for an 80/20 animal and
+    4% for a 60/40 one.
+
+    BACKWARD COMPATIBILITY is load-bearing. With sigma_bias=None no extra
+    random draws are made, so the RNG stream is identical to the original
+    implementation and every previously reported number reproduces exactly. Do
+    not "simplify" this by always drawing the sixth state.
     """
     np.random.seed(seed)
     T = len(choices)
-    P = np.zeros((num_particles, 5))
+    with_bias = sigma_bias is not None
+    # Engagement needs BOTH a volatility and an observed ignore channel: without
+    # `ignored` there are no no-response events to identify theta from, and the
+    # state would be a free parameter with no data behind it.
+    with_eng = sigma_engage is not None and ignored is not None
+    if sigma_engage is not None and ignored is None:
+        raise ValueError("sigma_engage requires `ignored`: the engagement state "
+                         "is identified from observed no-response trials, not "
+                         "inferred from choices alone")
+    if ignored is None:
+        ignored = np.zeros(T, dtype=bool)
+    ignored = np.asarray(ignored, dtype=bool)
+
+    # Callers mark ignored trials with an out-of-range choice (-1) so that any
+    # code path forgetting the mask fails loudly. Numpy would instead index the
+    # LAST column silently, so build an explicit safe index: the value is never
+    # used on an ignored trial (its likelihood is 1 - theta and Q does not
+    # move), but it must not be a negative index either.
+    choices = np.asarray(choices)
+    bad = ~ignored & ~np.isin(choices, (0, 1))
+    if bad.any():
+        raise ValueError(
+            f"{int(bad.sum())} answered trials have a choice outside (0, 1); "
+            f"first at index {int(np.argmax(bad))} with value "
+            f"{choices[np.argmax(bad)]}")
+    safe_choices = np.where(ignored, 0, choices).astype(int)
+
+    # Adaptive resampling. Resampling on EVERY trial discards particle
+    # diversity even when the weights are near-uniform: multinomial draws with
+    # uniform weights still leave only N(1-(1-1/N)^N) ~ 0.63N distinct
+    # particles. Resampling only when the effective sample size falls below a
+    # threshold keeps that diversity. With resample_threshold = 1.0 the filter
+    # resamples every trial and every code path below is byte-identical to the
+    # original, so old results reproduce exactly.
+    adaptive = resample_threshold < 1.0
+    w = np.full(num_particles, 1.0 / num_particles) if adaptive else None
+    if adaptive:
+        def wmean(x):
+            return float(np.sum(w * x))
+
+        def wstd(x):
+            m = float(np.sum(w * x))
+            return float(np.sqrt(max(np.sum(w * (x - m) ** 2), 0.0)))
+
+        def whist(x, e):
+            # scaled to sum to num_particles so the units match the
+            # unweighted path
+            return np.histogram(x, bins=e, weights=w * num_particles)[0]
+    else:
+        wmean, wstd = np.mean, np.std
+
+        def whist(x, e):
+            return np.histogram(x, bins=e)[0]
+
+    # column layout, built so that DISABLED states draw no random numbers at
+    # all -- that is what keeps the RNG stream, and therefore every earlier
+    # result, bit-identical when a state is switched off
+    c_bias = 5 if with_bias else None
+    c_eng = (5 + int(with_bias)) if with_eng else None
+    P = np.zeros((num_particles, 5 + int(with_bias) + int(with_eng)))
     P[:, 0] = np.random.uniform(0, 1, num_particles)
     P[:, 1] = np.random.uniform(0, 1, num_particles)
-    P[:, 2] = np.random.normal(np.log(0.3), 0.5, num_particles)
+    P[:, 2] = np.random.normal(*ALPHA_PRIOR_LOGIT, num_particles)
     P[:, 3] = np.random.normal(np.log(15.0), 0.5, num_particles)
     P[:, 4] = np.random.normal(0.0, 0.5, num_particles)
+    if with_bias:
+        # centred on zero with phi's prior width: PsyTrack's bias weight also
+        # starts at 0 rather than at the observed choice rate
+        P[:, c_bias] = np.random.normal(0.0, 0.5, num_particles)
+    if with_eng:
+        # logit space, centred on theta = 0.88 because most trials in this task
+        # are answered. Weakly informative on purpose: theta is identified by
+        # the observed ignores, unlike alpha/beta/phi which are inferred only
+        # from choice consistency.
+        P[:, c_eng] = np.random.normal(2.0, 1.0, num_particles)
 
     nll_train = 0.0
     prev = 0.0
     p_right = np.zeros(T)
     out = ({k: np.zeros(T) for k in
             ("alpha", "beta", "phi", "rpe", "q_left", "q_right",
-             "alpha_sd", "beta_sd", "phi_sd", "p_right_sd")}
+             "alpha_sd", "beta_sd", "phi_sd", "p_right_sd",
+             "bias", "bias_sd", "engage", "engage_sd")}
            if collect else None)
+
+    # Optional per-trial particle HISTOGRAMS. The posterior over a latent is not
+    # generally unimodal -- resampling can split the cloud -- so mean +- sd can
+    # describe a distribution that does not exist. hist_bins returns the full
+    # marginal at every trial so multimodality and collapse are visible.
+    # beta is binned in log10 because it spans 0.01 to 100.
+    do_hist = collect and hist_bins
+    if do_hist:
+        nb = int(hist_bins)
+        edges = {"alpha": np.linspace(0.0, 1.0, nb + 1),
+                 "beta": np.linspace(-2.0, 2.0, nb + 1),      # log10 scale
+                 "phi": np.linspace(-6.0, 6.0, nb + 1),
+                 "bias": np.linspace(-6.0, 6.0, nb + 1)}
+        for k, e in edges.items():
+            out[f"{k}_hist"] = np.zeros((T, nb))
+            out[f"{k}_edges"] = e
 
     for t in range(T):
         P[:, 2] += np.random.normal(0, sigma_alpha, num_particles)
         P[:, 3] += np.random.normal(0, sigma_beta, num_particles)
         P[:, 4] += np.random.normal(0, sigma_phi, num_particles)
+        if with_bias:
+            P[:, c_bias] += np.random.normal(0, sigma_bias, num_particles)
+        if with_eng:
+            P[:, c_eng] += np.random.normal(0, sigma_engage, num_particles)
 
-        alpha_vals = np.clip(np.exp(P[:, 2]), 1e-4, 0.99)
-        beta_vals = np.clip(np.exp(P[:, 3]), 0.01, 100.0)
+        # clip the STATE, not the value: a state left free to wander past the
+        # boundary takes many steps to return, which is what created the
+        # pile-up at the clip
+        P[:, 3] = np.clip(P[:, 3], LOG_BETA_LO, LOG_BETA_HI)
+        alpha_vals = expit(P[:, 2])          # in (0, 1) by construction
+        beta_vals = np.exp(P[:, 3])          # in [0.01, 100] by construction
         phi_vals = P[:, 4]
+        # clipped so a runaway bias cannot single-handedly saturate the logit;
+        # generous bound -- |b| = 9.2 already gives P(right) = 0.9999
+        bias_vals = np.clip(P[:, c_bias], -10.0, 10.0) if with_bias else 0.0
+        # P(the animal answers this trial at all)
+        theta_vals = (expit(np.clip(P[:, c_eng], -10.0, 10.0))
+                      if with_eng else None)
         Q = P[:, :2]
 
-        z = beta_vals * (Q[:, 1] - Q[:, 0]) + phi_vals * prev
+        z = beta_vals * (Q[:, 1] - Q[:, 0]) + phi_vals * prev + bias_vals
         pr_right = expit(np.clip(z, -50, 50))
         probs = np.column_stack([1.0 - pr_right, pr_right])
-        p_right[t] = np.mean(pr_right)
+        p_right[t] = wmean(pr_right)
 
         if collect:
-            out["alpha"][t] = np.mean(alpha_vals)
-            out["beta"][t] = np.mean(beta_vals)
-            out["phi"][t] = np.mean(phi_vals)
-            out["alpha_sd"][t] = np.std(alpha_vals)
-            out["beta_sd"][t] = np.std(beta_vals)
-            out["phi_sd"][t] = np.std(phi_vals)
-            out["p_right_sd"][t] = np.std(pr_right)
-            out["q_left"][t] = np.mean(Q[:, 0])
-            out["q_right"][t] = np.mean(Q[:, 1])
-            out["rpe"][t] = rewards[t] - np.mean(Q[:, choices[t]])
+            out["alpha"][t] = wmean(alpha_vals)
+            out["beta"][t] = wmean(beta_vals)
+            out["phi"][t] = wmean(phi_vals)
+            out["alpha_sd"][t] = wstd(alpha_vals)
+            out["beta_sd"][t] = wstd(beta_vals)
+            out["phi_sd"][t] = wstd(phi_vals)
+            out["p_right_sd"][t] = wstd(pr_right)
+            out["q_left"][t] = wmean(Q[:, 0])
+            out["q_right"][t] = wmean(Q[:, 1])
+            out["rpe"][t] = (np.nan if ignored[t] else
+                             rewards[t] - wmean(Q[:, safe_choices[t]]))
+            if with_bias:
+                out["bias"][t] = wmean(bias_vals)
+                out["bias_sd"][t] = wstd(bias_vals)
+            if with_eng:
+                out["engage"][t] = wmean(theta_vals)
+                out["engage_sd"][t] = wstd(theta_vals)
+            if do_hist:
+                out["alpha_hist"][t] = whist(alpha_vals, edges["alpha"])
+                out["beta_hist"][t] = whist(
+                    np.log10(np.clip(beta_vals, 1e-2, 1e2)), edges["beta"])
+                out["phi_hist"][t] = whist(phi_vals, edges["phi"])
+                if with_bias:
+                    out["bias_hist"][t] = whist(bias_vals, edges["bias"])
 
-        p_choice = probs[np.arange(num_particles), choices[t]]
+        p_choice = probs[np.arange(num_particles), safe_choices[t]]
+
+        # p_obs is the likelihood of what was actually OBSERVED on this trial.
+        # Without engagement that is the choice. With engagement the observation
+        # is two-stage: either the animal did not answer (probability 1 - theta)
+        # or it answered and chose (theta * p_choice). p_right stays the
+        # CONDITIONAL choice probability either way, so scoring against a model
+        # without an engagement state compares like with like.
+        if with_eng:
+            p_obs = (1.0 - theta_vals) if ignored[t] else theta_vals * p_choice
+        else:
+            p_obs = p_choice
 
         if train_mask[t]:
-            nll_train -= np.log(np.mean(p_choice) + 1e-16)
-            weights = p_choice / (np.sum(p_choice) + 1e-16)
-            if np.sum(weights) < 1e-20:
-                weights = np.ones(num_particles) / num_particles
-            weights /= np.sum(weights)
-            idx = np.random.choice(num_particles, size=num_particles, p=weights)
-            P = P[idx].copy()
+            if adaptive:
+                # the incremental log evidence uses the weights carried in from
+                # earlier trials: log p(y_t | y_1:t-1) = log sum_i w_i p_obs_i.
+                # It reduces to log mean(p_obs) whenever w is uniform, which is
+                # every trial in the resample-always path.
+                nll_train -= np.log(float(np.sum(w * p_obs)) + 1e-16)
+                w = w * p_obs
+                tot = float(np.sum(w))
+                w = (np.full(num_particles, 1.0 / num_particles)
+                     if tot < 1e-20 else w / tot)
+                if 1.0 / np.sum(w ** 2) < resample_threshold * num_particles:
+                    P = P[_resample_idx(w, num_particles, resample)].copy()
+                    w = np.full(num_particles, 1.0 / num_particles)
+            else:
+                nll_train -= np.log(np.mean(p_obs) + 1e-16)
+                weights = p_obs / (np.sum(p_obs) + 1e-16)
+                if np.sum(weights) < 1e-20:
+                    weights = np.ones(num_particles) / num_particles
+                weights /= np.sum(weights)
+                P = P[_resample_idx(weights, num_particles, resample)].copy()
 
         # observed either way -- the choice happened, only its likelihood term
-        # is withheld
-        ar = np.clip(np.exp(P[:, 2]), 1e-4, 0.99)
-        P[:, choices[t]] += ar * (rewards[t] - P[:, choices[t]])
-        prev = 1.0 if choices[t] == 1 else -1.0
+        # is withheld. On an IGNORED trial there was no choice and no outcome,
+        # so Q does not move and `prev` carries the last actual choice forward:
+        # perseveration is about the last thing the animal DID.
+        if not ignored[t]:
+            ar = expit(P[:, 2])
+            ci = safe_choices[t]
+            P[:, ci] += ar * (rewards[t] - P[:, ci])
+            prev = 1.0 if ci == 1 else -1.0
 
     if collect:
         out["p_right"] = p_right
@@ -277,19 +556,124 @@ def mmlpf_masked(sigma_alpha, sigma_beta, sigma_phi, choices, rewards,
     return nll_train, p_right
 
 
-def _mmlpf_train_nll(hyper, choices, rewards, train_mask):
+def _mmlpf_train_nll(hyper, choices, rewards, train_mask,
+                     resample="systematic", resample_threshold=0.5):
+    """Objective for the 3-parameter (no bias) volatility fit.
+
+    The resampling scheme is an explicit argument rather than a module-level
+    setting because differential_evolution(workers>1) pickles this function and
+    its args; a module global would not survive a spawn-based worker.
+    """
     sa, sb, sp = hyper
-    nll, _ = mmlpf_masked(sa, sb, sp, choices, rewards, train_mask)
+    nll, _ = mmlpf_masked(sa, sb, sp, choices, rewards, train_mask,
+                          resample=resample,
+                          resample_threshold=resample_threshold)
     return nll
 
 
+def _mmlpf_bias_train_nll(hyper, choices, rewards, train_mask,
+                          resample="systematic", resample_threshold=0.5):
+    """Objective for the 4-parameter volatility fit, drifting bias enabled.
+
+    Separate function rather than a branch inside _mmlpf_train_nll so the
+    3-parameter path is untouched and stays picklable for workers>1.
+    """
+    sa, sb, sp, sbias = hyper
+    nll, _ = mmlpf_masked(sa, sb, sp, choices, rewards, train_mask,
+                          sigma_bias=sbias, resample=resample,
+                          resample_threshold=resample_threshold)
+    return nll
+
+
+def fit_pooled(sessions, maxiter=DE_MAXITER, popsize=DE_POPSIZE,
+               num_particles=M_PARTICLES, seed=0, with_bias=True,
+               with_engage=False, bounds=None,
+               resample="systematic", resample_threshold=0.5):
+    """ONE volatility vector for all sessions of a subject.
+
+    WHY POOL
+    --------
+    The per-session volatility estimate is barely identified. On six sessions
+    simulated from an identical generative process with a TRUE sigma_alpha of
+    exactly zero, the per-session estimate ranged over [0.001, 0.400] -- the
+    whole search interval -- with a median of 0.13. The likelihood surface in
+    sigma is nearly flat and what the optimiser finds is dominated by
+    session-level noise, not by the parameter.
+
+    Pooling replaces S noisy draws with one estimate from the joint likelihood.
+    It is also FREE: the per-session scheme runs S separate searches of D
+    evaluations each, the pooled scheme runs one search of D evaluations that
+    each touch S sessions. Same S*D filter runs either way.
+
+    NOT LEAKAGE
+    -----------
+    Every session's held-out blocks are excluded from its own training
+    likelihood, so no held-out trial contributes to the estimate. A session is
+    scored with a sigma informed by that subject's OTHER sessions, which is
+    pooling across independent replicates -- the same thing a hierarchical
+    model does -- not information flowing backwards from the test set.
+
+    Parameters
+    ----------
+    sessions : list of dicts with keys "choices", "rewards", "train_mask", and
+        optionally "ignored".
+    bounds : search box. Defaults to the module bounds for the requested model
+        size, which are deliberately tight for sigma_bias and sigma_engage --
+        with a likelihood surface this flat a bound is a weak prior doing real
+        work, not a thumb on the scale.
+
+    Returns
+    -------
+    (sigmas, result) -- the fitted tuple and the scipy OptimizeResult.
+    """
+    if not sessions:
+        raise ValueError("fit_pooled needs at least one session")
+    if bounds is None:
+        bounds = (DE_BOUNDS_ENGAGE if with_engage
+                  else DE_BOUNDS_BIAS if with_bias else DE_BOUNDS)
+
+    def obj(v):
+        total = 0.0
+        for s in sessions:
+            total += mmlpf_masked(
+                v[0], v[1], v[2], s["choices"], s["rewards"], s["train_mask"],
+                num_particles=num_particles, seed=seed,
+                sigma_bias=(v[3] if with_bias or with_engage else None),
+                sigma_engage=(v[4] if with_engage else None),
+                ignored=s.get("ignored"),
+                resample=resample, resample_threshold=resample_threshold)[0]
+        return total
+
+    res = differential_evolution(obj, bounds=bounds, maxiter=maxiter,
+                                 popsize=popsize, tol=0.01, seed=0,
+                                 polish=False)
+    return tuple(float(x) for x in res.x), res
+
+
 def fit_mmlpf_masked(choices, rewards, train_mask, maxiter=DE_MAXITER,
-                     popsize=DE_POPSIZE, workers=1):
-    """M-step over (sigma_alpha, sigma_beta, sigma_phi) on training trials."""
-    res = differential_evolution(
-        _mmlpf_train_nll, bounds=DE_BOUNDS,
-        args=(choices, rewards, train_mask), maxiter=maxiter, popsize=popsize,
-        workers=workers, tol=0.01, seed=0, polish=False)
+                     popsize=DE_POPSIZE, workers=1, with_bias=False,
+                     resample="systematic", resample_threshold=0.5):
+    """Maximum marginal likelihood fit of the volatilities, training trials only.
+
+    with_bias=False -> returns (sigma_alpha, sigma_beta, sigma_phi)
+    with_bias=True  -> returns (sigma_alpha, sigma_beta, sigma_phi, sigma_bias)
+
+    The 4-parameter search costs roughly 4/3 as many objective evaluations for
+    the same maxiter/popsize, and each evaluation is marginally slower, so
+    budget about 1.5x the runtime of the 3-parameter fit.
+    """
+    if with_bias:
+        res = differential_evolution(
+            _mmlpf_bias_train_nll, bounds=DE_BOUNDS_BIAS,
+            args=(choices, rewards, train_mask, resample,
+                  resample_threshold), maxiter=maxiter,
+            popsize=popsize, workers=workers, tol=0.01, seed=0, polish=False)
+    else:
+        res = differential_evolution(
+            _mmlpf_train_nll, bounds=DE_BOUNDS,
+            args=(choices, rewards, train_mask, resample,
+                  resample_threshold), maxiter=maxiter,
+            popsize=popsize, workers=workers, tol=0.01, seed=0, polish=False)
     return tuple(float(v) for v in res.x)
 
 
@@ -303,8 +687,24 @@ def bits(p_right, y, mask):
 
 
 def score_session(choices, rewards, block=20, test_frac=0.2, seed=0,
-                  smooth=False, workers=1, verbose=True):
-    """Run the block-CV comparison on one session of valid trials."""
+                  smooth=False, workers=1, verbose=True, sigmas=None,
+                  fit_only=False, resample="systematic",
+                  resample_threshold=0.5):
+    """Run the block-CV comparison on one session of valid trials.
+
+    sigmas : (sigma_alpha, sigma_beta, sigma_phi) to USE rather than fit. This
+        is what enables two-pass subject-level scoring: pass 1 fits a sigma per
+        session, the caller takes the median across that subject's sessions,
+        and pass 2 re-scores every session with the shared value. The
+        per-session estimate is dominated by session noise -- on sessions
+        simulated with a TRUE sigma of exactly zero the per-session fit ranged
+        over essentially the whole search interval, while the median across
+        four sessions had about a third of the across-subject spread.
+
+    fit_only : return just the fitted sigmas, skipping the GLM and the scored
+        pass. Pass 1 needs nothing else, and a scored pass at E_PARTICLES is
+        wasted when its sigma is about to be replaced.
+    """
     T = len(choices)
     train_mask = make_block_mask(T, block=block, test_frac=test_frac, seed=seed)
     test_mask = ~train_mask
@@ -313,6 +713,11 @@ def score_session(choices, rewards, block=20, test_frac=0.2, seed=0,
               f"({test_mask.mean():.0%}) in {int(test_mask.sum() // block)} "
               f"blocks of {block}")
 
+    if fit_only:
+        return fit_mmlpf_masked(choices, rewards, train_mask, workers=workers,
+                                resample=resample,
+                                resample_threshold=resample_threshold)
+
     sess = np.zeros(T, dtype=int)
     rew, unrew = build_glm_regressors(choices, rewards, sess, n_lags=N_LAGS)
     X = np.column_stack([np.ones(T), rew, unrew])
@@ -320,9 +725,15 @@ def score_session(choices, rewards, block=20, test_frac=0.2, seed=0,
     sig = fit_glm_sigma(X, choices, train_mask, workers=workers)
     p_glm, p_glm_s = glm_masked(X, choices, sig, train_mask, smooth=smooth)
 
-    sa, sb, sp = fit_mmlpf_masked(choices, rewards, train_mask, workers=workers)
+    if sigmas is None:
+        sa, sb, sp = fit_mmlpf_masked(
+            choices, rewards, train_mask, workers=workers, resample=resample,
+            resample_threshold=resample_threshold)
+    else:
+        sa, sb, sp = (float(v) for v in sigmas)
     pf = mmlpf_masked(sa, sb, sp, choices, rewards, train_mask,
-                      num_particles=E_PARTICLES, collect=True)
+                      num_particles=E_PARTICLES, collect=True,
+                      resample=resample, resample_threshold=resample_threshold)
 
     base = np.full(T, choices[train_mask].mean())
 

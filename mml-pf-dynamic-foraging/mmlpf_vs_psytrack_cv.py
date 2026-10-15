@@ -287,7 +287,7 @@ def objective_function_persev(hyperparams, train_sessions):
 
 
 def fit_mmlpf_persev(train_sessions, de_workers=1):
-    """M-step over (sigma_alpha, sigma_beta, sigma_phi).
+    """volatility fit over (sigma_alpha, sigma_beta, sigma_phi).
 
     Bounds widened to 0.4: on real data the source file's 0.2 ceiling was
     binding on ~15% of fits, and a value sitting on its bound is not an estimate.
@@ -308,7 +308,7 @@ def objective_function(hyperparams, train_sessions):
 
 
 def fit_mmlpf(train_sessions, de_workers=1):
-    """M-step. de_workers MUST stay 1 when the outer loop is parallel."""
+    """volatility fit. de_workers MUST stay 1 when the outer loop is parallel."""
     res = differential_evolution(
         func=objective_function, bounds=DE_BOUNDS, args=(train_sessions,),
         maxiter=DE_MAXITER, popsize=DE_POPSIZE, workers=de_workers, disp=False,

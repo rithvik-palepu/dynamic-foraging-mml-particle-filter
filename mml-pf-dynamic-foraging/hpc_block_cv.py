@@ -66,6 +66,8 @@ RESULT_COLUMNS = [
     "subject_id", "session_number", "seed", "n_trials", "n_test", "block",
     "base_bits", "glm_bits", "mmlpf_bits", "diff_bits",
     "glm_sigma", "sigma_alpha", "sigma_beta", "sigma_phi",
+    "sigma_alpha_session", "sigma_beta_session", "sigma_phi_session",
+    "n_sigma_fits",
     "mean_beta", "max_beta", "mean_phi",
     "mmlpf_loss_conc", "mmlpf_worst_bits", "glm_loss_conc", "glm_worst_bits",
     "seconds", "error",
@@ -164,19 +166,43 @@ def load_cached_subject(cache_dir, subject_id):
 # ---------------------------------------------------------------------------
 # stage 2: one array task = one subject
 # ---------------------------------------------------------------------------
-def _placement(args):
-    """Module-level so multiprocessing can pickle it."""
+def _fit_sigma(args):
+    """PASS 1: fit a volatility per (session, placement). Module-level for mp.
+
+    No GLM and no scored pass -- only the sigma is wanted, and the scored pass
+    at E_PARTICLES would be thrown away when the shared sigma replaces it.
+    """
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
         os.environ[var] = "1"
     sid, sess_no, choices, rewards, seed, block, test_frac = args
+    try:
+        sa, sb, sp = bc.score_session(choices, rewards, block=block,
+                                      test_frac=test_frac, seed=seed,
+                                      workers=1, verbose=False, fit_only=True)
+        return (sess_no, seed, sa, sb, sp, "")
+    except Exception as e:
+        traceback.print_exc()
+        return (sess_no, seed, np.nan, np.nan, np.nan, f"{type(e).__name__}: {e}")
+
+
+def _placement(args):
+    """PASS 2: score one placement at the SHARED subject-level volatility."""
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[var] = "1"
+    (sid, sess_no, choices, rewards, seed, block, test_frac,
+     shared, own, n_fits) = args
     row = {c: np.nan for c in RESULT_COLUMNS}
-    row.update(subject_id=sid, session_number=sess_no, seed=seed, error="")
+    row.update(subject_id=sid, session_number=sess_no, seed=seed, error="",
+               sigma_alpha_session=own[0], sigma_beta_session=own[1],
+               sigma_phi_session=own[2], n_sigma_fits=n_fits)
     t0 = time.time()
     try:
         res, _ = bc.score_session(choices, rewards, block=block,
                                   test_frac=test_frac, seed=seed,
-                                  smooth=False, workers=1, verbose=False)
+                                  smooth=False, workers=1, verbose=False,
+                                  sigmas=shared)
         row.update({k: v for k, v in res.items() if k in RESULT_COLUMNS})
     except Exception as e:
         row["error"] = f"{type(e).__name__}: {e}"
@@ -217,21 +243,73 @@ def run_task(cache_dir, out_dir, task_id, seeds=SEEDS, block=BLOCK,
                   f"moved aside", flush=True)
         else:
             done = {(int(r.session_number), int(r.seed)) for r in prev.itertuples()}
-            print(f"resuming: {len(done)} placements already done", flush=True)
+            print(f"found {len(done)} placements already written", flush=True)
 
     sessions = load_cached_subject(cache_dir, sid)
-    jobs = [(sid, sno, c, r, s, block, test_frac)
-            for (sno, c, r, _nraw, _nign) in sessions
-            for s in range(seeds) if (sno, s) not in done]
-    print(f"subject {sid}: {len(sessions)} sessions, {len(jobs)} placements "
-          f"to fit on {cores} core(s)", flush=True)
-    if not jobs:
-        return pd.read_csv(out_csv)
+    want = {(sno, s) for (sno, _c, _r, _nraw, _nign) in sessions
+            for s in range(seeds)}
+
+    # The volatility used to score a session is the MEDIAN across all of this
+    # subject's placements, so it depends on the whole set. Resuming a
+    # partially-finished subject would leave earlier rows scored under a
+    # different shared sigma than later ones -- silently mixing two models in
+    # one CSV, the same failure mode as the old schema drift. So the resume
+    # unit is the SUBJECT: complete means skip, incomplete means redo.
+    if done:
+        if want <= done:
+            print(f"subject {sid}: complete ({len(done)} placements), skipping",
+                  flush=True)
+            return pd.read_csv(out_csv)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        os.rename(out_csv, out_csv.replace(".csv", f"_partial_{stamp}.csv"))
+        print(f"subject {sid}: {len(done)}/{len(want)} placements present -- "
+              f"moved aside and refitting the whole subject, because the "
+              f"shared volatility depends on all of them", flush=True)
+
+    fit_jobs = [(sid, sno, c, r, s, block, test_frac)
+                for (sno, c, r, _nraw, _nign) in sessions
+                for s in range(seeds)]
+    print(f"subject {sid}: {len(sessions)} sessions, {len(fit_jobs)} placements "
+          f"on {cores} core(s)", flush=True)
+    if not fit_jobs:
+        return None
 
     def append(row):
         pd.DataFrame([row], columns=RESULT_COLUMNS).to_csv(
             out_csv, mode="a", header=not os.path.exists(out_csv), index=False)
 
+    t_start = time.time()
+
+    # ---------------- PASS 1: a volatility per placement ----------------
+    if cores > 1:
+        import multiprocessing as mp
+        with mp.Pool(cores) as pool:
+            fits = list(pool.imap_unordered(_fit_sigma, fit_jobs))
+    else:
+        fits = [_fit_sigma(j) for j in fit_jobs]
+
+    ok = np.array([[f[2], f[3], f[4]] for f in fits if f[5] == ""], dtype=float)
+    n_bad = sum(1 for f in fits if f[5] != "")
+    if not len(ok):
+        raise RuntimeError(
+            f"subject {sid}: every volatility fit failed. First error: "
+            f"{fits[0][5]}")
+    shared = tuple(float(v) for v in np.median(ok, axis=0))
+    own_by_key = {(f[0], f[1]): (f[2], f[3], f[4]) for f in fits}
+    spread = ok.max(axis=0) - ok.min(axis=0)
+    print(f"subject {sid}: shared volatility (median of {len(ok)} placement "
+          f"fits, {n_bad} failed) "
+          f"a {shared[0]:.3f} b {shared[1]:.3f} phi {shared[2]:.3f}", flush=True)
+    print(f"    per-placement range  a {spread[0]:.3f}  b {spread[1]:.3f}  "
+          f"phi {spread[2]:.3f}   <- report this, not the point estimate",
+          flush=True)
+    print(f"    pass 1 took {(time.time()-t_start)/60:.1f} min", flush=True)
+
+    # ---------------- PASS 2: score at the shared volatility ----------------
+    jobs = [(sid, sno, c, r, s, block, test_frac, shared,
+             own_by_key.get((sno, s), (np.nan,) * 3), len(ok))
+            for (sno, c, r, _nraw, _nign) in sessions
+            for s in range(seeds)]
     t_start = time.time()
     if cores > 1:
         import multiprocessing as mp
@@ -263,7 +341,7 @@ def run_task(cache_dir, out_dir, task_id, seeds=SEEDS, block=BLOCK,
 # stage 3: combine
 # ---------------------------------------------------------------------------
 def combine(out_dir, fig="cohort_block_cv_hpc.png",
-            merged="cohort_block_cv_hpc.csv"):
+            merged="cohort_block_cv_hpc.csv", expect_seeds=None):
     from scipy import stats
 
     files = sorted(f for f in glob.glob(os.path.join(out_dir, "*.csv"))
@@ -279,6 +357,30 @@ def combine(out_dir, fig="cohort_block_cv_hpc.png",
     n_err = len(df) - len(ok)
     if not len(ok):
         raise RuntimeError("every placement failed -- inspect the error column")
+
+    # completeness check: a task that timed out mid-way leaves a valid-looking
+    # partial CSV, and its per-subject median would then come from a
+    # non-random subset of block placements. Warn loudly rather than
+    # aggregating it silently.
+    mf_path = os.path.join(os.path.dirname(os.path.abspath(out_dir)), "cache",
+                           "manifest.csv")
+    if expect_seeds is not None:
+        counts = df.groupby("subject_id").size()
+        sess = df.groupby("subject_id")["session_number"].nunique()
+        short = [(s, int(counts[s]), int(sess[s] * expect_seeds))
+                 for s in counts.index
+                 if counts[s] < sess[s] * expect_seeds]
+        if short:
+            print(f"\nWARNING: {len(short)} subjects have fewer placements than "
+                  f"{expect_seeds} seeds x their session count:")
+            for s, got, want in short[:10]:
+                print(f"    {s}: {got}/{want}")
+            print("  their per-subject medians come from a non-random subset of "
+                  "placements.\n  Resubmit those array indices before quoting "
+                  "the summary.")
+        else:
+            print(f"completeness: all {len(counts)} subjects have "
+                  f"{expect_seeds} placements per session")
 
     per_sess = (ok.groupby(["subject_id", "session_number"])
                 .agg(diff=("diff_bits", "median"),
@@ -338,14 +440,47 @@ def combine(out_dir, fig="cohort_block_cv_hpc.png",
           f"({'MMLPF' if gap > 0 else 'PsyTrack'} assigns that factor more "
           f"probability to the observed choice)")
 
+    # placements attempted per subject, needed to turn `blown` into a RATE.
+    n_plac = ok.groupby("subject_id").size().reindex(per_subj.index)
+    per_subj["n_plac"] = n_plac.values
+    per_subj["blown_frac"] = (per_subj["blown"] / per_subj["n_plac"]).round(4)
+
+    # A ">= 1 sub-chance placement" test is useless once there are many
+    # placements per subject: at a 7% cohort rate and 200 placements,
+    # P(>=1) = 1.0, so it flags every subject regardless of health. Compare each
+    # subject against the COHORT rate instead, and flag only those materially
+    # worse. Note this is a relative test -- if the cohort-wide rate is itself
+    # high, that is a finding about the model, not about any one animal.
+    from scipy import stats as _st
+    cohort_rate = float(per_subj["blown"].sum() / per_subj["n_plac"].sum())
+    thresh = max(2 * cohort_rate, cohort_rate + 0.05)
+    outlier = per_subj[per_subj["blown_frac"] > thresh]
+
     hi_var = per_subj[per_subj["var_ratio"] > 4]
-    bl = per_subj[per_subj["blown"] > 0]
     print(f"\n{'-'*74}")
-    print("filter stability, two criteria:")
-    print(f"  MMLPF variance > 4x the GLM's       : {len(hi_var)}/{n} subjects")
-    print(f"  >= 1 placement worse than base rate : {len(bl)}/{n} subjects")
+    print("filter stability")
+    print(f"  cohort-wide sub-chance placement rate: {cohort_rate:.1%} "
+          f"({int(per_subj['blown'].sum())}/{int(per_subj['n_plac'].sum())})")
+    if cohort_rate > 0.02:
+        print(f"  NOTE this is cohort-wide, so it is a property of the MODEL, "
+              f"not of\n  particular animals: on ~{cohort_rate:.0%} of block "
+              f"placements the filter\n  predicts worse than the animal's own "
+              f"choice base rate.")
+    print(f"  MMLPF variance > 4x the GLM's        : {len(hi_var)}/{n} subjects")
+    print(f"  sub-chance rate > {thresh:.1%} (2x cohort) : {len(outlier)}/{n} "
+          f"subjects")
+    if len(outlier):
+        o = outlier.copy()
+        o["binom_p"] = [
+            _st.binomtest(int(b), int(t), cohort_rate).pvalue
+            for b, t in zip(o["blown"], o["n_plac"])]
+        print(o[["diff", "blown", "n_plac", "blown_frac", "binom_p",
+                 "var_ratio"]].round(4).to_string())
+        print("  these are the animals where the MEDIAN is the only defensible "
+              "summary")
     if len(hi_var):
-        print(hi_var[["diff", "var_ratio", "blown", "n_sessions"]].round(3).to_string())
+        print(hi_var[["diff", "var_ratio", "blown", "n_plac", "n_sessions"]]
+              .round(3).to_string())
 
     _plot(per_subj, fig)
     return per_subj
@@ -363,8 +498,17 @@ def _plot(per_subj, fname):
                                    gridspec_kw={"width_ratios": [1, 1.2]})
 
     y = np.arange(n)
-    cols = [GREY if b > 0 else (C_MM if v > 0 else C_GLM)
-            for v, b in zip(s["diff"], s["blown"])]
+    # shade by sub-chance RATE relative to the cohort, not by "any at all":
+    # with hundreds of placements per subject, "blown > 0" is true for
+    # everyone and greys out the whole panel, hiding the actual result
+    if "blown_frac" in s.columns:
+        rate = float(per_subj["blown"].sum() / per_subj["n_plac"].sum())
+        cut = max(2 * rate, rate + 0.05)
+        flag = s["blown_frac"] > cut
+    else:
+        flag = s["blown"] > 0
+    cols = [GREY if f else (C_MM if v > 0 else C_GLM)
+            for v, f in zip(s["diff"], flag)]
     ax1.barh(y, s["diff"].values, color=cols, height=0.8)
     ax1.axvline(0, color="k", lw=1.0)
     ax1.axvline(s["diff"].median(), color=C_MM, ls="--", lw=1.2)
@@ -378,8 +522,11 @@ def _plot(per_subj, fname):
                   loc="left")
     ax1.text(0.98, 0.015, "right = MMLPF better", transform=ax1.transAxes,
              ha="right", va="bottom", fontsize=6.5, color=GREY)
-    if (s["blown"] > 0).any():
-        ax1.text(0.02, 0.985, "grey = filter destabilised\non >=1 placement",
+    if flag.any():
+        ax1.text(0.02, 0.985,
+                 f"grey = sub-chance on >{cut:.0%} of placements\n"
+                 f"(cohort rate {rate:.0%})" if "blown_frac" in s.columns
+                 else "grey = filter destabilised\non >=1 placement",
                  transform=ax1.transAxes, va="top", fontsize=6.5, color=GREY)
     ax1.margins(y=0.01)
 
@@ -523,7 +670,7 @@ def main():
                  block=args.block, test_frac=args.test_frac, cores=args.cores)
 
     elif args.stage == "combine":
-        combine(args.out_dir)
+        combine(args.out_dir, expect_seeds=args.seeds)
 
     elif args.stage == "write-sbatch":
         mf_path = os.path.join(args.cache_dir, "manifest.csv")

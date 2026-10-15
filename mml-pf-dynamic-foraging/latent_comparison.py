@@ -55,7 +55,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import block_cv as bc
 import mmlpf_vs_psytrack_cv as cv
-from matched_validation import build_glm_regressors
+from block_cv import build_glm_regressors
 from plot_foraging_session import plot_foraging_session
 
 C_GLM = "#c8511b"
